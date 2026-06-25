@@ -1,0 +1,6 @@
+# POCO 核心模块仅依赖 Python 标准库（zipfile, xml, re）
+# 以下为可选依赖
+python-docx>=1.0.0
+
+# Streamlit UI（交互式 Web 界面）
+streamlit>=1.28.0
