@@ -1,5 +1,5 @@
 """
-POCO v3.4 Streamlit App — 产品化 Word 模板自动生成工具。
+POCO v3.5 Streamlit App — 多格式文档自动生成工具。
 
 Run:
     streamlit run poco/ui/app.py
@@ -11,6 +11,7 @@ Features:
     - 字段自动分类（user_input vs auto_generated）
     - UI 仅展示需用户填写的字段，隐藏公式/随机/派生字段
     - 多模板批量生成
+    - 多格式支持：.docx (Word) + .odt (OpenDocument)
 """
 
 import io
@@ -35,6 +36,8 @@ from poco.engine import (
     CONTEXT_BASE_FIELDS,
 )
 from poco.filler import fill_template
+from poco.core import DocumentEngine, detect_format
+from poco.pdf_export import check_libreoffice, docx_to_pdf
 from poco.validator import validate_required_fields
 from poco.templates.registry import (
     list_templates as list_rule_templates,
@@ -66,12 +69,15 @@ def _sanitize_filename_part(s: str) -> str:
     return result.strip().strip(".")
 
 
-def _build_output_filename(template_name: str, last_name: str, first_name: str) -> str:
+def _build_output_filename(
+    template_name: str, last_name: str, first_name: str, ext: str = ".docx"
+) -> str:
     """
-    构建输出文件名：模板名-姓_名.docx
+    构建输出文件名：模板名-姓_名.ext
 
     - 非法字符自动过滤
     - 姓/名为空时使用 "Unknown"
+    - ext 参数指定扩展名（.docx / .odt）
     - 示例：Return Ticket-PAN_YU.docx
     """
     last = _sanitize_filename_part(last_name) if last_name else ""
@@ -87,7 +93,7 @@ def _build_output_filename(template_name: str, last_name: str, first_name: str) 
         person = f"{last}_{first}"
 
     template_part = _sanitize_filename_part(template_name)
-    return f"{template_part}-{person}.docx"
+    return f"{template_part}-{person}{ext}"
 
 
 # ---- Batch Generation ----------------------------------------------------------
@@ -99,7 +105,7 @@ def generate_all(
     seed: Optional[int] = None,
 ) -> List[str]:
     """
-    批量生成：多选模板 → 生成全部文档。
+    批量生成：多选模板 → 生成全部文档（自动识别 .docx / .odt 格式）。
 
     Args:
         selected_templates: 模板元数据列表（来自 template_storage 的 list 条目）
@@ -107,17 +113,19 @@ def generate_all(
         seed:               随机种子
 
     Returns:
-        list[filepath] — 生成的所有 .docx 文件路径列表
+        list[filepath] — 生成的所有文档文件路径列表
     """
     last_name = user_info.get("姓", "")
     first_name = user_info.get("名", "")
 
     output_paths: List[str] = []
+    engine = DocumentEngine()
 
     for tmpl in selected_templates:
         tpath = tmpl["path"]
         tname = tmpl["display_name"]
         tid = tmpl.get("template_id")
+        fmt = tmpl.get("format", "docx")  # 从元数据获取格式
 
         mapping = generate_mapping_for_template(
             template_path=tpath,
@@ -126,9 +134,12 @@ def generate_all(
             template_id=tid,
         )
 
-        filename = _build_output_filename(tname, last_name, first_name)
+        ext = f".{fmt}"
+        filename = _build_output_filename(tname, last_name, first_name, ext=ext)
         output_path = os.path.join(tempfile.gettempdir(), filename)
-        fill_template(tpath, output_path, mapping)
+
+        # 使用统一引擎处理（自动选择渲染器）
+        engine.process(tpath, mapping, output_path)
         output_paths.append(output_path)
 
     return output_paths
@@ -146,13 +157,13 @@ def _make_zip_bytes(file_paths: List[str], entry_names: Optional[List[str]] = No
 # ---- Page Config -------------------------------------------------------------
 
 st.set_page_config(
-    page_title="POCO — 文档自动生成系统",
+    page_title="POCO — 多格式文档生成系统",
     page_icon="📄",
     layout="wide",
 )
 
-st.title("📄 POCO — Word 模板自动生成工具")
-st.caption("模板库选择 → 填写信息 → 一键批量生成 Word 文档")
+st.title("📄 POCO — 多格式文档自动生成工具")
+st.caption("模板库选择 → 填写信息 → 一键批量生成 .docx / .odt 文档")
 
 # ============================================================================
 #  Login Gate
@@ -209,6 +220,9 @@ if "uploaded_template_path" not in st.session_state:
     st.session_state.uploaded_template_path = None
 if "delete_target" not in st.session_state:
     st.session_state.delete_target = None  # {name, display_name} 待删除模板
+if "libreoffice_available" not in st.session_state:
+    # 缓存 LibreOffice 检测结果，避免每次刷新都重新检测
+    st.session_state.libreoffice_available = check_libreoffice()
 
 
 def refresh_library():
@@ -348,16 +362,22 @@ with st.sidebar:
     st.subheader("📤 上传新模板")
 
     uploaded_file = st.file_uploader(
-        "选择 .docx 文件",
-        type=["docx"],
+        "选择 .docx 或 .odt 文件",
+        type=["docx", "odt"],
         key="new_template_uploader",
-        help="上传包含 {{占位符}} 标记的 Word 文档。",
+        help="上传包含 {{占位符}} 标记的文档（Word 或 OpenDocument 格式）。",
     )
 
     if uploaded_file is not None:
+        # 去除扩展名作为默认模板名
+        default_name = uploaded_file.name
+        for ext in (".docx", ".odt", ".DOCX", ".ODT"):
+            if default_name.endswith(ext):
+                default_name = default_name[:-len(ext)]
+                break
         upload_name = st.text_input(
             "模板名称",
-            value=uploaded_file.name.replace(".docx", ""),
+            value=default_name,
             help="在模板库中的显示名称。",
         )
 
@@ -531,7 +551,48 @@ else:
             shown = sorted(all_auto_generated)
             st.text(", ".join(shown))
 
-    # ---- Section 3: Generate ----
+    # ---- Section 3: Output Format ----
+    st.subheader("📦 输出格式")
+
+    libre_available = st.session_state.libreoffice_available
+
+    col_fmt1, col_fmt2, col_fmt3 = st.columns(3)
+    with col_fmt1:
+        export_word = st.checkbox(
+            "📄 Word (.docx)",
+            value=True,
+            key="export_word_cb",
+            help="生成并下载 Word 文档",
+        )
+    with col_fmt2:
+        export_odt = st.checkbox(
+            "📝 ODT (.odt)",
+            value=False,
+            key="export_odt_cb",
+            help="生成并下载 OpenDocument 文档",
+        )
+    with col_fmt3:
+        export_pdf = st.checkbox(
+            "📕 PDF (.pdf)",
+            value=False,
+            key="export_pdf_cb",
+            disabled=not libre_available,
+            help=(
+                "使用 LibreOffice 自动转换为 PDF"
+                if libre_available
+                else "需要安装 LibreOffice 才能使用此功能"
+            ),
+        )
+
+    # LibreOffice 未安装时的友好提示
+    if not libre_available:
+        st.caption("⚠ 当前环境未安装 LibreOffice，仅支持 Word / ODT 导出。")
+
+    # 至少选择一种输出格式的校验
+    if not export_word and not export_odt and not export_pdf:
+        st.warning("⚠ 请至少选择一种输出格式。")
+
+    # ---- Section 4: Generate ----
     st.divider()
 
     batch_count = len(template_meta)
@@ -551,11 +612,16 @@ else:
 
         success_count = 0
         results: List[dict] = []
+        engine = DocumentEngine()
 
         for tmpl in template_meta:
             tpath = tmpl["path"]
             tname = tmpl["display_name"]
             tid = tmpl.get("template_id")
+            # 检测模板的原生格式
+            tmpl_fmt = tmpl.get("format") or detect_format(tpath)
+            if tmpl_fmt == "unknown":
+                tmpl_fmt = "docx"  # 回退
 
             try:
                 mapping = generate_mapping_for_template(
@@ -565,45 +631,97 @@ else:
                     template_id=tid,
                 )
 
-                # Write filled output
+                # 确定输出扩展名
+                out_ext = f".{tmpl_fmt}"
+                out_filename = _build_output_filename(
+                    tname,
+                    user_info.get("姓", ""),
+                    user_info.get("名", ""),
+                    ext=out_ext,
+                )
+
+                # 使用统一引擎生成文档
                 with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".docx"
+                    delete=False, suffix=out_ext
                 ) as out:
                     output_path = out.name
 
-                fill_template(tpath, output_path, mapping)
+                engine.process(tpath, mapping, output_path)
 
                 # Read back for download
                 with open(output_path, "rb") as f:
                     output_bytes = f.read()
+
+                # PDF 导出（如果用户勾选了 PDF）
+                pdf_bytes = None
+                pdf_filename = None
+                if export_pdf:
+                    pdf_filename = out_filename.replace(out_ext, ".pdf")
+                    with tempfile.NamedTemporaryFile(
+                        delete=False, suffix=".pdf"
+                    ) as pdf_tmp:
+                        pdf_output_path = pdf_tmp.name
+
+                    pdf_ok = docx_to_pdf(output_path, pdf_output_path)
+                    if pdf_ok:
+                        with open(pdf_output_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        try:
+                            os.unlink(pdf_output_path)
+                        except OSError:
+                            pass
+                    else:
+                        try:
+                            os.unlink(pdf_output_path)
+                        except OSError:
+                            pass
+                        if export_word or export_odt:
+                            st.warning(
+                                f"⚠ {tname}: PDF 转换失败，仅生成文档文件。"
+                            )
+                        else:
+                            st.error(
+                                f"❌ {tname}: PDF 转换失败，无法生成文件。"
+                            )
+                            continue
+
+                # 确定要显示的格式标签和 MIME 类型
+                if tmpl_fmt == "odt":
+                    format_label = "ODT"
+                    mime_type = (
+                        "application/"
+                        "vnd.oasis.opendocument.text"
+                    )
+                else:
+                    format_label = "Word"
+                    mime_type = (
+                        "application/"
+                        "vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
+                    )
 
                 results.append({
                     "name": tname,
                     "path": output_path,
                     "data": output_bytes,
                     "mapping": mapping,
-                    "filename": _build_output_filename(
-                        tname,
-                        user_info.get("姓", ""),
-                        user_info.get("名", ""),
-                    ),
+                    "filename": out_filename,
+                    "format": tmpl_fmt,
+                    "format_label": format_label,
+                    "mime_type": mime_type,
+                    "pdf_data": pdf_bytes,
+                    "pdf_filename": pdf_filename,
                 })
                 success_count += 1
 
-                # 记录生成历史（CSV 兼容 + JSON 结构化日志）
-                output_filename = _build_output_filename(
-                    tname,
-                    user_info.get("姓", ""),
-                    user_info.get("名", ""),
-                )
+                # 记录生成历史
                 log_generation_csv(
                     surname=user_info.get("姓", ""),
                     given_name=user_info.get("名", ""),
                     passport_no=user_info.get("护照号", ""),
                     template_name=tname,
-                    output_filename=output_filename,
+                    output_filename=out_filename,
                 )
-                # v3.4 JSON 操作日志（含用户 + 完整字段映射）
                 log_generation(
                     user=st.session_state.user or "unknown",
                     template=tname,
@@ -624,50 +742,127 @@ else:
 
             if success_count == 1:
                 r = results[0]
-                st.download_button(
-                    label=f"📥 下载 {r['filename']}",
-                    data=r["data"],
-                    file_name=r["filename"],
-                    mime="application/"
-                    "vnd.openxmlformats-officedocument."
-                    "wordprocessingml.document",
-                    use_container_width=True,
-                )
+
+                # 文档下载按钮（自动适配格式）
+                if export_word or export_odt:
+                    st.download_button(
+                        label=f"📥 下载 {r['format_label']} - {r['filename']}",
+                        data=r["data"],
+                        file_name=r["filename"],
+                        mime=r["mime_type"],
+                        use_container_width=True,
+                    )
+
+                # PDF 下载按钮
+                if export_pdf and r.get("pdf_data"):
+                    st.download_button(
+                        label=f"📥 下载 PDF - {r['pdf_filename']}",
+                        data=r["pdf_data"],
+                        file_name=r["pdf_filename"],
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+
                 with st.expander("🔍 预览生成字段映射"):
                     st.json(r["mapping"])
             else:
                 # Batch: ZIP download + individual downloads
                 st.subheader("📥 下载")
 
-                # ZIP all generated docs
-                zip_bytes = _make_zip_bytes(
-                    [r["path"] for r in results],
-                    entry_names=[r["filename"] for r in results],
-                )
-                st.download_button(
-                    label="📦 打包下载全部（ZIP）",
-                    data=zip_bytes,
-                    file_name="poco_generated_docs.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                    key="dl_zip_all",
-                )
+                # 分离 Word 和 ODT 结果
+                docx_results = [r for r in results if r.get("data") and r.get("format") != "odt"]
+                odt_results = [r for r in results if r.get("data") and r.get("format") == "odt"]
+                has_pdf = any(r.get("pdf_data") for r in results)
+
+                # ZIP all generated Word docs
+                if export_word and docx_results:
+                    zip_bytes = _make_zip_bytes(
+                        [r["path"] for r in docx_results],
+                        entry_names=[r["filename"] for r in docx_results],
+                    )
+                    st.download_button(
+                        label="📦 打包下载全部 Word（ZIP）",
+                        data=zip_bytes,
+                        file_name="poco_generated_docs.docx.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key="dl_zip_docx_all",
+                    )
+
+                # ZIP all generated ODT docs
+                if export_odt and odt_results:
+                    zip_bytes = _make_zip_bytes(
+                        [r["path"] for r in odt_results],
+                        entry_names=[r["filename"] for r in odt_results],
+                    )
+                    st.download_button(
+                        label="📦 打包下载全部 ODT（ZIP）",
+                        data=zip_bytes,
+                        file_name="poco_generated_docs.odt.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key="dl_zip_odt_all",
+                    )
+
+                # ZIP all generated PDFs
+                if export_pdf and has_pdf:
+                    pdf_temp_paths = []
+                    pdf_entry_names = []
+                    for r in results:
+                        if r.get("pdf_data"):
+                            pdf_tmp = tempfile.NamedTemporaryFile(
+                                delete=False, suffix=".pdf"
+                            )
+                            pdf_tmp.write(r["pdf_data"])
+                            pdf_tmp.flush()
+                            pdf_temp_paths.append(pdf_tmp.name)
+                            pdf_entry_names.append(r["pdf_filename"])
+                    if pdf_temp_paths:
+                        pdf_zip_bytes = _make_zip_bytes(
+                            pdf_temp_paths,
+                            entry_names=pdf_entry_names,
+                        )
+                        st.download_button(
+                            label="📦 打包下载全部 PDF（ZIP）",
+                            data=pdf_zip_bytes,
+                            file_name="poco_generated_pdfs.zip",
+                            mime="application/zip",
+                            use_container_width=True,
+                            key="dl_zip_pdf_all",
+                        )
+                        for p in pdf_temp_paths:
+                            try:
+                                os.unlink(p)
+                            except OSError:
+                                pass
 
                 # Individual download buttons
                 for r in results:
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        st.caption(r["name"])
-                    with col2:
-                        st.download_button(
-                            label="📥 下载",
-                            data=r["data"],
-                            file_name=r["filename"],
-                            mime="application/"
-                            "vnd.openxmlformats-officedocument."
-                            "wordprocessingml.document",
-                            key=f"dl_{r['name']}",
-                        )
+                    fmt_icon = "📝" if r.get("format") == "odt" else "📄"
+                    st.caption(f"{fmt_icon} {r['name']} [{r.get('format', 'docx').upper()}]")
+
+                    col_doc, col_pdf = st.columns(2)
+                    if (export_word or export_odt) and r.get("data"):
+                        with col_doc:
+                            st.download_button(
+                                label=f"📥 {r['format_label']} - {r['filename']}",
+                                data=r["data"],
+                                file_name=r["filename"],
+                                mime=r["mime_type"],
+                                key=f"dl_{r['format']}_{r['name']}",
+                                use_container_width=True,
+                            )
+                    if export_pdf and r.get("pdf_data"):
+                        with col_pdf:
+                            st.download_button(
+                                label=f"📥 PDF - {r['pdf_filename']}",
+                                data=r["pdf_data"],
+                                file_name=r["pdf_filename"],
+                                mime="application/pdf",
+                                key=f"dl_pdf_{r['name']}",
+                                use_container_width=True,
+                            )
+                    st.caption("---")
 
                 # Shared mapping preview
                 with st.expander("🔍 预览全部字段映射"):
@@ -679,7 +874,8 @@ else:
 
 st.divider()
 st.caption(
-    f"POCO v3.4 — 模板库：{len(st.session_state.saved_templates)} 个模板"
+    f"POCO v3.5 — 模板库：{len(st.session_state.saved_templates)} 个模板"
     f" | 规则分组：{len(list_rule_templates())} 组"
     f" | 操作日志：{get_log_count()} 条"
+    f" | 支持格式：.docx / .odt"
 )

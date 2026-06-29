@@ -158,8 +158,13 @@ def generate_mapping_for_template(
     # 先生成（已按 template_id 过滤的）全量 mapping
     full_mapping = generate_mapping(user_info, seed=seed, template_id=template_id)
 
-    # 按模板占位符过滤
-    text = read_docx_text(template_path)
+    # 使用格式感知的扫描器，兼容 docx 和 odt
+    try:
+        from .core.engine import scan_template_text
+        text = scan_template_text(template_path)
+    except (ImportError, ValueError):
+        # 回退到纯 docx 扫描（向后兼容）
+        text = read_docx_text(template_path)
     placeholders = extract_placeholders(text)
 
     filtered: Dict[str, str] = {}
@@ -205,10 +210,13 @@ def classify_template_fields(
     from .scanner import read_docx_text
     from .extractor import extract_placeholders
 
-    text = read_docx_text(template_path)
+    # 使用格式感知的扫描器，兼容 docx 和 odt
+    try:
+        from .core.engine import scan_template_text
+        text = scan_template_text(template_path)
+    except (ImportError, ValueError):
+        text = read_docx_text(template_path)
     placeholders = extract_placeholders(text)
-
-    # 使用与 generate_mapping 相同的规则过滤，确保分类与生成一致
     rules = _filter_rules_by_template(template_id)
     rule_field_names: set = {r.field_name for r in rules}
 

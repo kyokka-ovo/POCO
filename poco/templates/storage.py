@@ -3,6 +3,10 @@
 
 提供模板文件的持久化存取：保存、列表、获取路径、删除。
 元数据以 JSON 文件存储在 storage/ 目录中。
+
+支持格式:
+  - .docx (Microsoft Word)
+  - .odt  (OpenDocument Text)
 """
 
 import json
@@ -16,6 +20,9 @@ from typing import Dict, List, Optional
 
 _STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
 _METADATA_FILE = os.path.join(_STORAGE_DIR, "_metadata.json")
+
+# 支持的模板文件扩展名
+_SUPPORTED_EXTENSIONS = {".docx", ".odt"}
 
 
 # ---- 内部辅助 ----------------------------------------------------------------
@@ -47,14 +54,41 @@ def _save_metadata(data: dict) -> None:
 
 
 def _sanitize_filename(name: str) -> str:
-    """清理文件名，移除不安全字符"""
-    # 移除 .docx 后缀（如果存在），后续统一添加
-    if name.lower().endswith(".docx"):
-        name = name[:-5]
+    """清理文件名，移除不安全字符并去除扩展名"""
+    # 移除已知扩展名后缀（后续统一添加）
+    for ext in _SUPPORTED_EXTENSIONS:
+        if name.lower().endswith(ext):
+            name = name[:-len(ext)]
+            break
     # 替换不安全字符
     for ch in r'<>:"/\|?*':
         name = name.replace(ch, "_")
     return name.strip()
+
+
+def _detect_ext_from_bytes(data: bytes) -> str:
+    """
+    从文件字节内容检测扩展名。
+
+    通过检查 ZIP 签名和内部 mimetype 区分 docx/odt。
+    默认为 .docx（向后兼容）。
+    """
+    try:
+        import zipfile, io
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+            # 检查 mimetype
+            try:
+                mime = zf.read("mimetype").decode("utf-8").strip()
+                if "opendocument.text" in mime:
+                    return ".odt"
+            except (KeyError, UnicodeDecodeError):
+                pass
+            # 检查 DOCX 特征文件
+            if "word/document.xml" in zf.namelist():
+                return ".docx"
+    except Exception:
+        pass
+    return ".docx"  # 默认
 
 
 # ---- 公共 API ----------------------------------------------------------------
@@ -66,10 +100,10 @@ def save_template(
     template_id: Optional[str] = None,
 ) -> str:
     """
-    将 .docx 文件保存到模板存储库。
+    将模板文件保存到模板存储库（自动检测 .docx / .odt 格式）。
 
     Args:
-        source_path: 源 .docx 文件路径
+        source_path: 源文件路径（.docx 或 .odt）
         name:        模板显示名称（用于列表和选择）
         template_id: 关联的规则集 ID（可选，如 "return_ticket"）
 
@@ -79,7 +113,12 @@ def save_template(
     _ensure_storage()
 
     safe_name = _sanitize_filename(name)
-    dest_filename = f"{safe_name}.docx"
+
+    # 从源文件获取扩展名
+    _, ext = os.path.splitext(source_path)
+    if ext.lower() not in _SUPPORTED_EXTENSIONS:
+        ext = ".docx"  # 默认
+    dest_filename = f"{safe_name}{ext}"
     dest_path = os.path.join(_STORAGE_DIR, dest_filename)
 
     # 复制文件
@@ -91,6 +130,7 @@ def save_template(
         "filename": dest_filename,
         "display_name": name,
         "template_id": template_id,
+        "format": ext.lstrip("."),  # "docx" 或 "odt"
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     _save_metadata(meta)
@@ -100,7 +140,7 @@ def save_template(
 
 def save_uploaded_bytes(data: bytes, name: str, template_id: Optional[str] = None) -> str:
     """
-    保存上传的字节内容到模板存储库。
+    保存上传的字节内容到模板存储库（自动检测 .docx / .odt 格式）。
 
     Args:
         data:        上传文件的字节内容
@@ -112,8 +152,11 @@ def save_uploaded_bytes(data: bytes, name: str, template_id: Optional[str] = Non
     """
     import tempfile
 
-    # 先写入临时文件，再通过 save_template 统一处理
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+    # 检测文件扩展名
+    ext = _detect_ext_from_bytes(data)
+
+    # 写入临时文件
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
 
@@ -126,7 +169,7 @@ def save_uploaded_bytes(data: bytes, name: str, template_id: Optional[str] = Non
 
 def list_saved_templates() -> List[dict]:
     """
-    列出所有已保存的模板。
+    列出所有已保存的模板（包括 .docx 和 .odt）。
 
     Returns:
         [
@@ -135,6 +178,7 @@ def list_saved_templates() -> List[dict]:
                 "display_name": "Return Ticket",
                 "template_id": "return_ticket",
                 "filename": "return_ticket.docx",
+                "format": "docx",
                 "saved_at": "2026-06-23 14:30:00",
                 "path": "/full/path/to/storage/return_ticket.docx",
             },
@@ -153,6 +197,7 @@ def list_saved_templates() -> List[dict]:
                 "display_name": info.get("display_name", name),
                 "template_id": info.get("template_id"),
                 "filename": info["filename"],
+                "format": info.get("format", "docx"),  # 兼容旧元数据（无 format 字段）
                 "saved_at": info.get("saved_at", "unknown"),
                 "path": filepath,
             })
@@ -160,19 +205,23 @@ def list_saved_templates() -> List[dict]:
             # 文件丢失，跳过
             pass
 
-    # 同时扫描 storage 目录中未被元数据记录的文件
+    # 同时扫描 storage 目录中未被元数据记录的文件（兼容直接放入的文件）
     known_files = {info["filename"] for info in meta.values()}
     for fname in os.listdir(_STORAGE_DIR):
-        if fname.startswith("_") or not fname.endswith(".docx"):
+        if fname.startswith("_") or not any(
+            fname.lower().endswith(ext) for ext in _SUPPORTED_EXTENSIONS
+        ):
             continue
         if fname not in known_files:
             filepath = os.path.join(_STORAGE_DIR, fname)
-            display_name = fname.replace(".docx", "")
+            display_name = os.path.splitext(fname)[0]
+            _, ext = os.path.splitext(fname)
             result.append({
                 "name": display_name,
                 "display_name": display_name,
                 "template_id": None,
                 "filename": fname,
+                "format": ext.lstrip("."),
                 "saved_at": "unknown",
                 "path": filepath,
             })
@@ -187,7 +236,7 @@ def get_template_path(name: str) -> Optional[str]:
     根据模板名称获取完整文件路径。
 
     Args:
-        name: 模板名称（不含 .docx 后缀）
+        name: 模板名称（不含扩展名）
 
     Returns:
         文件路径，不存在时返回 None
@@ -202,16 +251,19 @@ def delete_template(name: str) -> bool:
     """
     删除已保存的模板（文件 + 元数据）。
 
+    支持 .docx 和 .odt 格式。
+
     Returns:
         True 如果成功删除，False 如果模板不存在
     """
     meta = _load_metadata()
     if name not in meta:
-        # 尝试直接删除文件
-        filepath = os.path.join(_STORAGE_DIR, f"{name}.docx")
-        if os.path.exists(filepath):
-            os.remove(filepath)
-            return True
+        # 尝试直接删除文件（兼容未在元数据中记录的模板）
+        for ext in _SUPPORTED_EXTENSIONS:
+            filepath = os.path.join(_STORAGE_DIR, f"{name}{ext}")
+            if os.path.exists(filepath):
+                os.remove(filepath)
+                return True
         return False
 
     info = meta[name]

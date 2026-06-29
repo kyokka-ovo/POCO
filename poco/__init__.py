@@ -1,5 +1,9 @@
 """
-POCO — Word 模板占位符扫描 & 自动填充引擎。
+POCO — 多格式模板占位符扫描 & 自动填充引擎。
+
+支持格式:
+  - .docx (Microsoft Word)
+  - .odt  (OpenDocument Text)
 
 用法
 ----
@@ -13,12 +17,18 @@ POCO — Word 模板占位符扫描 & 自动填充引擎。
     mapping = poco.generate_mapping("template.docx")
     # => {"姓名": "", "护照号": "", "随机四位数": "5821", ...}
 
-    # 填充模板
+    # 填充模板（自动识别格式）
     poco.fill_template(
         "template.docx",
         "output.docx",
         {"姓名": "PAN YU", "护照号": "EJ6376603"},
     )
+
+    # --- 新 API: 多格式统一引擎 ---
+    from poco.core import DocumentEngine
+
+    engine = DocumentEngine()
+    engine.process("template.odt", data, "output.odt")
 """
 
 from typing import Dict, List
@@ -29,6 +39,16 @@ from .dynamic import is_dynamic, generate, generate_value_if_dynamic
 from .filler import fill_template
 from .validator import validate_mapping, validate_required_fields, check_residual, register_validator
 from . import engine  # v2 架构：规则插件化调度引擎
+
+# 多格式统一框架（v3.5+）
+from .core import (
+    detect_format,
+    SUPPORTED_FORMATS,
+    BaseRenderer,
+    DocumentEngine,
+    scan_template_text,
+)
+from .renderers import DocxRenderer, OdtRenderer
 
 
 def scan_template(filepath: str) -> List[str]:
